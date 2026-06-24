@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Windows S3/S4 循环唤醒测试工具 v1.4 (EXE 路径修复版)
+Windows S3/S4 循环唤醒测试工具 v1.5 (EXE 路径修复版)
 - 修复: InstanceId 日志显示
 - 修复: 子线程读取 tkinter 变量（拷贝配置）
 - 修复: 全设备快照对比影响最终 PASS/FAIL
@@ -11,6 +11,9 @@ Windows S3/S4 循环唤醒测试工具 v1.4 (EXE 路径修复版)
 - 修复: 关闭窗口后 root.after 崩溃
 - 增强: 入睡前设备状态写入日志
 - 增强: Problem 字段类型转换保护
+- 增强: 测试结束后在日志顶部插入失败汇总（失败次数及失败周期列表）
+- 修复: finish_test 重复调用防护
+- 修复: failed_cycles 属性缺失时防御性处理
 - 默认目标次数: 1000
 """
 
@@ -187,7 +190,7 @@ def setup_logging(log_path=None):
 class S3S4TestApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("S3/S4 循环唤醒测试工具 v1.4")
+        self.root.title("S3/S4 循环唤醒测试工具 v1.5")
         self.root.geometry("850x650")
         self.root.minsize(750, 550)
 
@@ -453,6 +456,8 @@ class S3S4TestApp:
         self._target_cycles = self.target_cycles
 
         self.logger, self.log_file = setup_logging()
+        self.failed_cycles = []
+        self._finish_called = False
         self.logger.info("==================================================")
         self.logger.info(f"S3/S4 循环唤醒测试开始 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"类型: {self._test_type}  目标: {self._target_cycles if self._target_cycles else '无限'}")
@@ -492,6 +497,7 @@ class S3S4TestApp:
                 cycle = self.current_cycle + 1
                 self.safe_after(lambda: self.status_label.config(text=f"周期 {cycle} 准备中..."))
                 mode = self._test_type if self._test_type != "Mixed" else ("S3" if cycle % 2 else "S4")
+                cycle_fail = False
 
                 # 入睡前快照
                 try:
@@ -499,6 +505,8 @@ class S3S4TestApp:
                 except Exception as e:
                     self.logger.error(f"获取进入前快照失败: {e}")
                     self.all_ok_so_far = False
+                    cycle_fail = True
+                    self.failed_cycles.append(cycle)
                     self.current_cycle = cycle
                     self.save_state()
                     continue
@@ -529,6 +537,8 @@ class S3S4TestApp:
                 except Exception as e:
                     self.logger.error(f"执行 {mode} 失败: {e}")
                     self.all_ok_so_far = False
+                    cycle_fail = True
+                    self.failed_cycles.append(cycle)
                     self.current_cycle = cycle
                     self.save_state()
                     continue
@@ -544,6 +554,8 @@ class S3S4TestApp:
                 except Exception as e:
                     self.logger.error(f"获取唤醒后快照失败: {e}")
                     self.all_ok_so_far = False
+                    cycle_fail = True
+                    self.failed_cycles.append(cycle)
                     self.current_cycle = cycle
                     self.save_state()
                     continue
@@ -556,7 +568,6 @@ class S3S4TestApp:
                 if self._enable_snapshot:
                     lost, new, changes = compare_snapshots(before_snap, after_snap, self._ignore_status_change)
 
-                cycle_fail = False
                 # 全设备快照对比结果更新 all_ok_so_far
                 if lost and self._loss_as_fail:
                     cycle_fail = True
@@ -566,6 +577,10 @@ class S3S4TestApp:
                     self.all_ok_so_far = False
                 if not after_ok:
                     cycle_fail = True
+
+                # 记录失败周期
+                if cycle_fail:
+                    self.failed_cycles.append(cycle)
 
                 # 构建日志块
                 block = []
@@ -616,8 +631,15 @@ class S3S4TestApp:
             self.finish_test()
 
     def finish_test(self):
+        # 防止重复调用（例如异常退出时 except 块再次调用）
+        if hasattr(self, '_finish_called') and self._finish_called:
+            return
+        self._finish_called = True
+
         self.test_running = False
         result = "PASS" if self.all_ok_so_far else "FAIL"
+
+        # 先构建终止信息写入日志
         self.logger.info("\n==================================================")
         self.logger.info("========== 测试终止 ==========")
         self.logger.info(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -627,6 +649,40 @@ class S3S4TestApp:
         self.logger.info(f"最终结果: {'通过（所有检查均正常）' if result == 'PASS' else '失败（存在异常周期，详见日志）'}")
         self.logger.info("=================================\n")
         self.save_state()
+
+        # ---- 在日志文件最顶部插入失败汇总 ----
+        if self.log_file and self.log_file.exists():
+            try:
+                # 先 flush 并关闭所有 handler，确保所有日志已写入磁盘
+                for handler in self.logger.handlers[:]:
+                    handler.flush()
+                    handler.close()
+                    self.logger.removeHandler(handler)
+
+                content = self.log_file.read_text(encoding='utf-8')
+
+                # 构建失败汇总块
+                failed = getattr(self, 'failed_cycles', [])
+                if failed:
+                    cycles_str = ', '.join(str(c) for c in failed)
+                    summary = (
+                        f"***** 失败汇总 *****\n"
+                        f"失败次数: {len(failed)} / {self.current_cycle}\n"
+                        f"失败的周期: [{cycles_str}]\n"
+                        f"********************\n"
+                    )
+                else:
+                    summary = (
+                        f"***** 失败汇总 *****\n"
+                        f"失败次数: 0 / {self.current_cycle}\n"
+                        f"********************\n"
+                    )
+
+                # 将汇总插入日志最顶部
+                self.log_file.write_text(summary + content, encoding='utf-8')
+            except Exception:
+                pass
+
         self.safe_after(lambda: self._on_test_finished(result))
 
     def _on_test_finished(self, result):
